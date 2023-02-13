@@ -1,40 +1,66 @@
 import threading
 
 import log
+from app.conf import ModuleConf
 from app.db import MediaDb
-from app.utils import ProgressController
-from app.utils.types import MediaType
+from app.helper import ProgressHelper, SubmoduleHelper
+from app.utils import ExceptionUtils
+from app.utils.commons import singleton
+from app.utils.types import MediaServerType
 from config import Config
-from app.mediaserver import Emby, Jellyfin, Plex
 
 lock = threading.Lock()
+server_lock = threading.Lock()
 
 
+@singleton
 class MediaServer:
-    _type = None
-    server = None
+    _mediaserver_schemas = []
+    _server_type = None
+    _server = None
     mediadb = None
     progress = None
 
     def __init__(self):
-        self.mediadb = MediaDb()
-        self.progress = ProgressController()
+        self._mediaserver_schemas = SubmoduleHelper.import_submodules(
+            'app.mediaserver.client',
+            filter_func=lambda _, obj: hasattr(obj, 'schema')
+        )
+        log.debug(f"【MediaServer】加载媒体服务器：{self._mediaserver_schemas}")
         self.init_config()
 
     def init_config(self):
-        self._type = Config().get_config('media').get('media_server')
-        if self._type == "jellyfin":
-            self.server = Jellyfin()
-        elif self._type == "plex":
-            self.server = Plex()
-        else:
-            self.server = Emby()
+        self.mediadb = MediaDb()
+        self.progress = ProgressHelper()
+        # 当前使用的媒体库服务器
+        _type = Config().get_config('media').get('media_server') or 'emby'
+        self._server_type = ModuleConf.MEDIASERVER_DICT.get(_type)
+        self._server = None
+
+    def __build_class(self, ctype, conf):
+        for mediaserver_schema in self._mediaserver_schemas:
+            try:
+                if mediaserver_schema.match(ctype):
+                    return mediaserver_schema(conf)
+            except Exception as e:
+                ExceptionUtils.exception_traceback(e)
+        return None
+
+    @property
+    def server(self):
+        with server_lock:
+            if not self._server:
+                self._server = self.__get_server(self._server_type)
+            return self._server
+
+    def __get_server(self, ctype: MediaServerType, conf=None):
+        return self.__build_class(ctype=ctype.value, conf=conf)
 
     def get_type(self):
         """
         当前使用的媒体库服务器
         """
-        return self._type or "emby"
+        return self._server_type
 
     def get_activity_log(self, limit):
         """
@@ -142,35 +168,36 @@ class MediaServer:
             return
         with lock:
             # 开始进度条
-            log.info("【MEDIASERVER】开始同步媒体库数据...")
+            log.info("【MediaServer】开始同步媒体库数据...")
             self.progress.start("mediasync")
-            self.progress.update(ptype="mediasync", text="正在获取数据...")
+            self.progress.update(ptype="mediasync", text="请稍候...")
             # 汇总统计
             medias_count = self.get_medias_count()
             total_media_count = medias_count.get("MovieCount") + medias_count.get("SeriesCount")
             total_count = 0
             movie_count = 0
             tv_count = 0
+            # 清空登记薄
+            self.mediadb.empty()
             for library in self.get_libraries():
-                # 清空登记薄
-                self.mediadb.empty(self._type, library.get("id"))
                 # 获取媒体库所有项目
                 self.progress.update(ptype="mediasync",
                                      text="正在获取 %s 数据..." % (library.get("name")))
                 for item in self.get_items(library.get("id")):
                     if not item:
                         continue
-                    if self.mediadb.insert(self._type, item):
+                    if self.mediadb.insert(self._server_type.value, item):
                         total_count += 1
-                        if item.get("type") == MediaType.MOVIE.value:
+                        if item.get("type") in ['Movie', 'movie']:
                             movie_count += 1
-                        elif item.get("type") == MediaType.TV.value:
+                        elif item.get("type") in ['Series', 'show']:
                             tv_count += 1
                         self.progress.update(ptype="mediasync",
-                                             text="正在同步 %s，已完成：%s / %s ..." % (library.get("name"), total_count, total_media_count),
-                                             value=round(100 * total_count/total_media_count, 1))
+                                             text="正在同步 %s，已完成：%s / %s ..." % (
+                                                 library.get("name"), total_count, total_media_count),
+                                             value=round(100 * total_count / total_media_count, 1))
             # 更新总体同步情况
-            self.mediadb.statistics(server_type=self._type,
+            self.mediadb.statistics(server_type=self._server_type.value,
                                     total_count=total_count,
                                     movie_count=movie_count,
                                     tv_count=tv_count)
@@ -179,20 +206,41 @@ class MediaServer:
                                  value=100,
                                  text="媒体库数据同步完成，同步数量：%s" % total_count)
             self.progress.end("mediasync")
-            log.info("【MEDIASERVER】媒体库数据同步完成，同步数量：%s" % total_count)
+            log.info("【MediaServer】媒体库数据同步完成，同步数量：%s" % total_count)
 
-    def check_item_exists(self, title, year, tmdbid=None):
+    def check_item_exists(self, title, year=None, tmdbid=None):
         """
         检查媒体库是否已存在某项目，非实时同步数据，仅用于展示
         """
-        return self.mediadb.exists(server_type=self._type, title=title, year=year, tmdbid=tmdbid)
+        return self.mediadb.exists(server_type=self._server_type.value,
+                                   title=title,
+                                   year=year,
+                                   tmdbid=tmdbid)
 
     def get_mediasync_status(self):
         """
         获取当前媒体库同步状态
         """
-        status = self.mediadb.get_statistics(server_type=self._type)
+        status = self.mediadb.get_statistics(server_type=self._server_type.value)
         if not status:
             return {}
         else:
-            return {"movie_count":  status[0][1], "tv_count": status[0][2], "time": status[0][3]}
+            return {"movie_count": status.MOVIE_COUNT, "tv_count": status.TV_COUNT, "time": status.UPDATE_TIME}
+
+    def get_iteminfo(self, itemid):
+        """
+        根据ItemId从媒体服务器查询项目详情
+        :param itemid: 在Emby中的ID
+        :return: 图片对应在TMDB中的URL
+        """
+        if not self.server:
+            return None
+        return self.server.get_iteminfo(itemid)
+
+    def get_playing_sessions(self):
+        """
+        获取正在播放的会话
+        """
+        if not self.server:
+            return None
+        return self.server.get_playing_sessions()
